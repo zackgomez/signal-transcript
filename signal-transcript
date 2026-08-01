@@ -1,0 +1,580 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["sqlcipher3-binary", "cryptography"]
+# ///
+"""
+signal-transcript — extract scoped, well-formatted transcripts from Signal Desktop's
+local (SQLCipher-encrypted) message database, for pasting/reading by Claude.
+
+Never touches the live DB: copies db.sqlite(+wal/shm) into a tempdir, opens the copy,
+and always cleans up. Read-only against Signal's data by construction; the only
+writes are transcript output (--out) and decrypted attachment copies (--attachments DIR).
+"""
+
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import mimetypes
+import os
+import re
+import shutil
+import sqlcipher3
+import sqlite3
+import sys
+import tempfile
+from datetime import datetime, timedelta
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+SIGNAL_DIR = os.path.expanduser("~/.config/Signal")
+CONFIG_PATH = os.path.join(SIGNAL_DIR, "config.json")
+SQL_DIR = os.path.join(SIGNAL_DIR, "sql")
+ATTACHMENTS_DIR = os.path.join(SIGNAL_DIR, "attachments.noindex")
+
+# sqlcipher3 defines its own exception classes rather than subclassing the
+# stdlib sqlite3 ones, so catch both — this is what a schema change (missing
+# table/column) surfaces as.
+DB_OPERATIONAL_ERRORS = (sqlite3.OperationalError, sqlcipher3.OperationalError)
+
+# Extras tables/decorations we've already warned about this run (warn once each).
+_schema_warnings: set[str] = set()
+
+
+def warn_schema_once(table: str, lost: str) -> None:
+    if table in _schema_warnings:
+        return
+    _schema_warnings.add(table)
+    print(f"warning: Signal schema changed — '{table}' unavailable, {lost} omitted", file=sys.stderr)
+
+
+def die_schema_changed(table: str) -> None:
+    sys.exit(
+        f"signal-transcript: Signal schema changed — table '{table}' missing or unreadable. "
+        "Signal Desktop may have updated."
+    )
+
+
+NOISE_TYPES = {
+    "keychange",
+    "profile-change",
+    "group-v2-change",
+    "message-request-response-event",
+    "title-transition-notification",
+}
+
+DURATION_RE = re.compile(r"^(\d+)\s*([mhdw])$", re.IGNORECASE)
+DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+# --------------------------------------------------------------------------
+# DB access
+# --------------------------------------------------------------------------
+
+def load_key() -> str:
+    with open(CONFIG_PATH) as f:
+        return json.load(f)["key"]
+
+
+def copy_db(tmpdir: str) -> str:
+    for fname in ("db.sqlite", "db.sqlite-wal", "db.sqlite-shm"):
+        src = os.path.join(SQL_DIR, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(tmpdir, fname))
+    return os.path.join(tmpdir, "db.sqlite")
+
+
+def open_db(path: str, key: str):
+    db = sqlcipher3.connect(path)
+    c = db.cursor()
+    c.execute(f'PRAGMA key = "x\'{key}\'"')
+    return db
+
+
+# --------------------------------------------------------------------------
+# Time parsing / formatting
+# --------------------------------------------------------------------------
+
+def parse_since(s: str) -> datetime:
+    s = s.strip()
+    m = DURATION_RE.match(s)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        return datetime.now().astimezone() - timedelta(seconds=n * DURATION_UNITS[unit])
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).astimezone()
+        except ValueError:
+            continue
+    raise ValueError(
+        f"cannot parse --since value {s!r}; use durations like 10m/2h/3d/1w "
+        "or dates like YYYY-MM-DD / 'YYYY-MM-DD HH:MM'"
+    )
+
+
+def fmt_hhmm(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+
+def fmt_day_header(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d (%A)")
+
+
+def fmt_range_label(start_dt: datetime, end_dt: datetime) -> str:
+    tzname = datetime.now().astimezone().tzname()
+    if start_dt.date() == end_dt.date():
+        return f"{start_dt.strftime('%Y-%m-%d %H:%M')}–{end_dt.strftime('%H:%M')} {tzname}"
+    return f"{start_dt.strftime('%Y-%m-%d %H:%M')} – {end_dt.strftime('%Y-%m-%d %H:%M')} {tzname}"
+
+
+# --------------------------------------------------------------------------
+# Conversation resolution
+# --------------------------------------------------------------------------
+
+def conv_display_name(row: dict) -> str:
+    return row.get("name") or row.get("profileFullName") or row.get("profileName") or row.get("e164") or "Unknown"
+
+
+def fetch_all_conversations(db) -> list[dict]:
+    c = db.cursor()
+    try:
+        c.execute(
+            "SELECT id, type, name, profileName, profileFullName, e164, serviceId, active_at "
+            "FROM conversations"
+        )
+        cols = [d[0] for d in c.description]
+        return [dict(zip(cols, row)) for row in c.fetchall()]
+    except DB_OPERATIONAL_ERRORS:
+        die_schema_changed("conversations")
+
+
+def find_matches(conversations: list[dict], query: str) -> list[dict]:
+    q = query.lower()
+    out = []
+    for row in conversations:
+        fields = [row.get("name"), row.get("profileFullName"), row.get("profileName"), row.get("e164")]
+        if any(f and q in f.lower() for f in fields):
+            out.append(row)
+    return out
+
+
+def fetch_messages_rows(c, sql: str, params) -> list[dict]:
+    try:
+        c.execute(sql, params)
+        rows = c.fetchall()
+        col_names = [d[0] for d in c.description]
+        return [dict(zip(col_names, r)) for r in rows]
+    except DB_OPERATIONAL_ERRORS:
+        die_schema_changed("messages")
+
+
+def fmt_active_at(ms) -> str:
+    if not ms:
+        return "never"
+    return datetime.fromtimestamp(ms / 1000).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+# --------------------------------------------------------------------------
+# Attachment extraction
+# --------------------------------------------------------------------------
+
+_FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def sanitize_filename(name: str) -> str:
+    name = _FILENAME_SANITIZE_RE.sub("_", os.path.basename(name)).strip("._")
+    return name or "attachment"
+
+
+def decrypt_local_attachment(blob: bytes, local_key_b64: str, size: int) -> bytes:
+    """Decrypt a version-2 locally-encrypted attachment file.
+
+    On-disk layout: IV(16) || AES-256-CBC ciphertext || HMAC-SHA256(32).
+    localKey is 64 bytes base64: AES key (32) || MAC key (32). The decrypted
+    plaintext is padded, so truncate to the recorded size.
+    """
+    keys = base64.b64decode(local_key_b64)
+    if len(keys) != 64:
+        raise ValueError(f"localKey is {len(keys)} bytes, expected 64")
+    aes_key, mac_key = keys[:32], keys[32:]
+    if len(blob) < 48:
+        raise ValueError("attachment file too short")
+    iv, ct = blob[:16], blob[16:-32]
+    calc_mac = hmac.new(mac_key, blob[:-32], hashlib.sha256).digest()
+    if not hmac.compare_digest(blob[-32:], calc_mac):
+        raise ValueError("HMAC verification failed")
+    dec = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
+    return (dec.update(ct) + dec.finalize())[:size]
+
+
+def extract_attachment(att: dict, out_dir: str, when: datetime) -> str:
+    """Decrypt/copy one attachment into out_dir; returns the written path.
+
+    Raises ValueError/OSError with a human-readable reason on failure.
+    """
+    path = att.get("path")
+    if not path:
+        raise ValueError("not downloaded")
+    src = os.path.join(ATTACHMENTS_DIR, path)
+    if not os.path.exists(src):
+        raise ValueError("file missing on disk")
+
+    with open(src, "rb") as f:
+        blob = f.read()
+    version = att.get("version") or 0
+    if version >= 2:
+        if not att.get("localKey"):
+            raise ValueError("no localKey for encrypted attachment")
+        data = decrypt_local_attachment(blob, att["localKey"], att["size"])
+        pt_hash = att.get("plaintextHash")
+        if pt_hash and hashlib.sha256(data).hexdigest() != pt_hash:
+            raise ValueError("plaintext hash mismatch after decrypt")
+    else:
+        # pre-v2 attachments are stored unencrypted
+        data = blob
+
+    base = sanitize_filename(att.get("fileName") or att.get("clientUuid") or "attachment")
+    if "." not in base:
+        ext = mimetypes.guess_extension(att.get("contentType") or "") or ""
+        base += ext
+    stamped = f"{when.strftime('%Y%m%d-%H%M')}-{base}"
+    dest = os.path.join(out_dir, stamped)
+    n = 1
+    while os.path.exists(dest):
+        root, ext = os.path.splitext(stamped)
+        dest = os.path.join(out_dir, f"{root}.{n}{ext}")
+        n += 1
+    with open(dest, "wb") as f:
+        f.write(data)
+    return dest
+
+
+# --------------------------------------------------------------------------
+# Message rendering
+# --------------------------------------------------------------------------
+
+def get_body(row_body, row_json: dict) -> str | None:
+    if row_body:
+        return row_body
+    return row_json.get("body")
+
+
+def call_direction_label(call_row) -> str:
+    if not call_row:
+        return "call"
+    direction, ctype, status, ts, ended = call_row
+    parts = []
+    if direction:
+        parts.append(direction.lower())
+    if ctype:
+        parts.append(ctype.lower())
+    label = " ".join(parts) if parts else "call"
+    extras = []
+    if status and status.lower() not in ("accepted",):
+        extras.append(status.lower())
+    if ended and ts and ended > ts:
+        secs = int((ended - ts) / 1000)
+        m, s = divmod(secs, 60)
+        h, m = divmod(m, 60)
+        if h:
+            extras.append(f"{h}h{m:02d}m")
+        elif m:
+            extras.append(f"{m}m{s:02d}s")
+        else:
+            extras.append(f"{s}s")
+    if extras:
+        label += ", " + ", ".join(extras)
+    return label
+
+
+def render_messages(db, conv: dict, msg_rows: list[dict], conv_by_id: dict, conv_by_serviceid: dict,
+                     is_group: bool, verbose: bool, attachments_dir: str | None = None) -> list[str]:
+    c = db.cursor()
+
+    # Preload calls history for any call-history messages in view
+    call_ids = [r["id"] for r in msg_rows if r["type"] == "call-history"]
+    calls_by_id = {}
+    if call_ids:
+        qmarks = ",".join("?" for _ in call_ids)
+        try:
+            c.execute(
+                f"SELECT callId, direction, type, status, timestamp, endedTimestamp "
+                f"FROM callsHistory WHERE callId IN ({qmarks})",
+                call_ids,
+            )
+            for callId, direction, ctype, status, ts, ended in c.fetchall():
+                calls_by_id[callId] = (direction, ctype, status, ts, ended)
+        except DB_OPERATIONAL_ERRORS:
+            warn_schema_once("callsHistory", "call details")
+
+    # Preload reactions and attachments for the messages in view
+    msg_ids = [r["id"] for r in msg_rows]
+    reactions_by_msg: dict[str, list] = {}
+    attachments_by_msg: dict[str, list] = {}
+    if msg_ids:
+        qmarks = ",".join("?" for _ in msg_ids)
+        try:
+            c.execute(
+                f"SELECT messageId, emoji, fromId FROM reactions WHERE messageId IN ({qmarks})",
+                msg_ids,
+            )
+            for messageId, emoji, fromId in c.fetchall():
+                reactions_by_msg.setdefault(messageId, []).append((emoji, fromId))
+        except DB_OPERATIONAL_ERRORS:
+            warn_schema_once("reactions", "reactions")
+
+        try:
+            c.execute(
+                f"SELECT messageId, contentType, fileName, path, size, localKey, version, "
+                f"plaintextHash, clientUuid FROM message_attachments "
+                f"WHERE messageId IN ({qmarks}) AND editHistoryIndex=-1 "
+                f"AND attachmentType IN ('attachment','sticker') ORDER BY orderInMessage",
+                msg_ids,
+            )
+            att_cols = [d[0] for d in c.description]
+            for r in c.fetchall():
+                att = dict(zip(att_cols, r))
+                attachments_by_msg.setdefault(att["messageId"], []).append(att)
+        except DB_OPERATIONAL_ERRORS:
+            warn_schema_once("message_attachments", "attachments")
+
+    lines: list[str] = []
+    last_day = None
+
+    for row in msg_rows:
+        mtype = row["type"]
+        if not verbose and mtype in NOISE_TYPES:
+            continue
+
+        try:
+            data = json.loads(row["json"]) if row["json"] else {}
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+
+        dt = datetime.fromtimestamp(row["sent_at"] / 1000).astimezone()
+        day = dt.date()
+        if last_day is not None and day != last_day:
+            lines.append(f"### {fmt_day_header(dt)}")
+        last_day = day
+
+        # sender
+        if mtype == "outgoing":
+            sender = "Zack"
+        elif is_group:
+            svc = row.get("sourceServiceId")
+            sender = conv_by_serviceid.get(svc)
+            if not sender:
+                sender = svc[:8] if svc else "Unknown"
+        else:
+            sender = conv_display_name(conv)
+
+        body_lines_out = []
+
+        if mtype == "call-history":
+            call_row = calls_by_id.get(row["id"])
+            body_lines_out.append(f"[call: {call_direction_label(call_row)}]")
+        elif data.get("deletedForEveryone"):
+            body_lines_out.append("[deleted]")
+        elif row["isViewOnce"]:
+            body_lines_out.append("[view-once media]")
+        else:
+            edited = bool(data.get("editHistory"))
+            body = get_body(row["body"], data)
+            if body:
+                text = body
+                if edited:
+                    text += " (edited)"
+                body_lines_out.append(text)
+
+        if not body_lines_out and not reactions_by_msg.get(row["id"]) and not attachments_by_msg.get(row["id"]) \
+                and not data.get("quote"):
+            # nothing renderable at all
+            continue
+
+        head = body_lines_out[0] if body_lines_out else ""
+        first, *rest = head.split("\n") if head else ("",)
+        lines.append(f"**{fmt_hhmm(dt)} {sender}:** {first}")
+        for cont in rest:
+            lines.append(f"  {cont}")
+
+        quote = data.get("quote")
+        if quote:
+            qtext = (quote.get("text") or "").strip().replace("\n", " ")
+            if len(qtext) > 60:
+                qtext = qtext[:60] + "…"
+            qauthor_svc = quote.get("authorAci")
+            qauthor = conv_by_serviceid.get(qauthor_svc, "Zack" if qauthor_svc is None else qauthor_svc[:8])
+            lines.append(f'  ↪ re: "{qtext}" ({qauthor})')
+
+        for emoji, fromId in reactions_by_msg.get(row["id"], []):
+            who = conv_by_id.get(fromId, fromId[:8] if fromId else "?")
+            lines.append(f"  [+{emoji} {who}]")
+
+        for att in attachments_by_msg.get(row["id"], []):
+            label = f"{att.get('contentType') or 'unknown'}"
+            if att.get("fileName"):
+                label += f" — {att['fileName']}"
+            if attachments_dir:
+                try:
+                    dest = extract_attachment(att, attachments_dir, dt)
+                    label += f" → {dest}"
+                except (ValueError, OSError) as e:
+                    label += f" (extract failed: {e})"
+            lines.append(f"  [attachment: {label}]")
+
+    return lines
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def cmd_list(db):
+    conversations = fetch_all_conversations(db)
+    conversations.sort(key=lambda r: r.get("active_at") or 0, reverse=True)
+    for row in conversations:
+        name = conv_display_name(row)
+        print(f"{fmt_active_at(row.get('active_at')):16}  {row['type']:8}  {name}")
+
+
+def resolve_conversation(db, query: str):
+    conversations = fetch_all_conversations(db)
+    matches = find_matches(conversations, query)
+    if len(matches) == 1:
+        return matches[0], conversations
+    if len(matches) > 1:
+        print(f"Multiple conversations match {query!r}:", file=sys.stderr)
+        for row in matches:
+            print(f"  {conv_display_name(row):30} {row['type']:8} last active {fmt_active_at(row.get('active_at'))}",
+                  file=sys.stderr)
+        sys.exit(2)
+    # no match
+    print(f"No conversation matches {query!r}.", file=sys.stderr)
+    conversations.sort(key=lambda r: r.get("active_at") or 0, reverse=True)
+    print("Most recently active conversations:", file=sys.stderr)
+    for row in conversations[:8]:
+        print(f"  {conv_display_name(row):30} {row['type']:8} last active {fmt_active_at(row.get('active_at'))}",
+              file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="signal-transcript",
+        description="Extract a scoped transcript from Signal Desktop's local DB.",
+    )
+    ap.add_argument("query", nargs="?", help="contact/group name substring (case-insensitive)")
+    ap.add_argument("--since", help="duration (10m/2h/3d/1w) or date (YYYY-MM-DD[ HH:MM]); default 1h")
+    ap.add_argument("--last", type=int, help="most recent N messages instead of a time window")
+    ap.add_argument("--list", action="store_true", help="list conversations and exit")
+    ap.add_argument("--max", type=int, default=500, help="cap on rendered messages (default 500)")
+    ap.add_argument("--out", help="write output to FILE instead of stdout")
+    ap.add_argument("--attachments", metavar="DIR",
+                    help="decrypt attachments of in-scope messages into DIR "
+                         "(created if needed); transcript lines gain the saved path")
+    ap.add_argument("--verbose", action="store_true", help="include noise event types")
+    args = ap.parse_args()
+
+    if not args.list and not args.query:
+        ap.error("query is required unless --list is given")
+
+    key = load_key()
+    tmpdir = tempfile.mkdtemp(prefix="signal-transcript-")
+    try:
+        dbpath = copy_db(tmpdir)
+        db = open_db(dbpath, key)
+
+        if args.list:
+            cmd_list(db)
+            return
+
+        conv, all_conversations = resolve_conversation(db, args.query)
+        conv_by_id = {r["id"]: conv_display_name(r) for r in all_conversations}
+        conv_by_serviceid = {r["serviceId"]: conv_display_name(r) for r in all_conversations if r.get("serviceId")}
+        is_group = conv["type"] != "private"
+
+        c = db.cursor()
+        cols = (
+            "id, json, body, type, sent_at, sourceServiceId, isViewOnce"
+        )
+
+        truncated = False
+        if args.last:
+            msg_rows = fetch_messages_rows(
+                c,
+                f"SELECT {cols} FROM messages WHERE conversationId=? ORDER BY sent_at DESC LIMIT ?",
+                (conv["id"], max(args.last, args.max)),
+            )
+            msg_rows.reverse()
+            if len(msg_rows) > args.max:
+                truncated = True
+                msg_rows = msg_rows[-args.max:]
+            elif len(msg_rows) > args.last:
+                msg_rows = msg_rows[-args.last:]
+            window_label = f"last {args.last} messages"
+            start_dt = end_dt = None
+            if msg_rows:
+                start_dt = datetime.fromtimestamp(msg_rows[0]["sent_at"] / 1000).astimezone()
+                end_dt = datetime.fromtimestamp(msg_rows[-1]["sent_at"] / 1000).astimezone()
+        else:
+            since_str = args.since or "1h"
+            since_dt = parse_since(since_str)
+            since_ms = int(since_dt.timestamp() * 1000)
+            msg_rows = fetch_messages_rows(
+                c,
+                f"SELECT {cols} FROM messages WHERE conversationId=? AND sent_at >= ? ORDER BY sent_at ASC",
+                (conv["id"], since_ms),
+            )
+            if len(msg_rows) > args.max:
+                truncated = True
+                msg_rows = msg_rows[-args.max:]
+            if DURATION_RE.match(since_str.strip()):
+                m = DURATION_RE.match(since_str.strip())
+                n, unit = m.group(1), m.group(2).lower()
+                unit_word = {"m": "minute", "h": "hour", "d": "day", "w": "week"}[unit]
+                if n != "1":
+                    unit_word += "s"
+                window_label = f"last {n} {unit_word}"
+            else:
+                window_label = f"since {since_str}"
+            start_dt = end_dt = None
+            if msg_rows:
+                start_dt = datetime.fromtimestamp(msg_rows[0]["sent_at"] / 1000).astimezone()
+                end_dt = datetime.fromtimestamp(msg_rows[-1]["sent_at"] / 1000).astimezone()
+
+        attachments_dir = None
+        if args.attachments:
+            attachments_dir = os.path.abspath(os.path.expanduser(args.attachments))
+            os.makedirs(attachments_dir, exist_ok=True)
+
+        lines = render_messages(db, conv, msg_rows, conv_by_id, conv_by_serviceid, is_group,
+                                args.verbose, attachments_dir)
+
+        name = conv_display_name(conv)
+        out_lines = [f"# Signal — {name}"]
+        count = len(msg_rows)
+        if start_dt and end_dt:
+            meta = f"_{window_label} · {fmt_range_label(start_dt, end_dt)} · {count} message{'s' if count != 1 else ''}_"
+        else:
+            meta = f"_{window_label} · 0 messages_"
+        out_lines.append(meta)
+        if truncated:
+            out_lines.append(f"_(truncated to the most recent {args.max} messages — older messages in this window were omitted)_")
+        out_lines.append("")
+        out_lines.extend(lines)
+
+        output = "\n".join(out_lines) + "\n"
+        if args.out:
+            with open(args.out, "w") as f:
+                f.write(output)
+        else:
+            sys.stdout.write(output)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
