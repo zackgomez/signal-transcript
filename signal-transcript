@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["sqlcipher3-binary", "cryptography"]
+# dependencies = ["sqlcipher3-wheels", "cryptography", "keyring; sys_platform == 'darwin'"]
 # ///
 """
 signal-transcript — extract scoped, well-formatted transcripts from Signal Desktop's
@@ -29,7 +29,14 @@ from datetime import datetime, timedelta
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-SIGNAL_DIR = os.path.expanduser("~/.config/Signal")
+if sys.platform == "darwin":
+    import keyring
+    import keyring.errors
+
+if sys.platform == "darwin":
+    SIGNAL_DIR = os.path.expanduser("~/Library/Application Support/Signal")
+else:
+    SIGNAL_DIR = os.path.expanduser("~/.config/Signal")
 CONFIG_PATH = os.path.join(SIGNAL_DIR, "config.json")
 SQL_DIR = os.path.join(SIGNAL_DIR, "sql")
 ATTACHMENTS_DIR = os.path.join(SIGNAL_DIR, "attachments.noindex")
@@ -73,9 +80,80 @@ DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 # DB access
 # --------------------------------------------------------------------------
 
-def load_key() -> str:
+# Our own Keychain item caching the decrypted DB key. Signal's 'Signal Safe
+# Storage' item is double-gated — a decrypt ACL trusting only Signal.app, plus
+# a partition list pinned to Signal's team ID — so any read of it by any other
+# process costs two permission dialogs. An item this script created itself is
+# readable by it silently, so normal runs pop no dialogs; the two Signal-item
+# dialogs recur only when this cache is absent or stale (first run, Signal
+# re-key, uv Python upgrade). Revoke anytime:
+#   security delete-generic-password -s signal-transcript
+CACHE_SERVICE = "signal-transcript"
+CACHE_ACCOUNT = "signal-db-key"
+
+
+def cached_key() -> str | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        return keyring.get_password(CACHE_SERVICE, CACHE_ACCOUNT)
+    except keyring.errors.KeyringError:
+        return None
+
+
+def store_cached_key(key: str) -> None:
+    if sys.platform != "darwin":
+        return
+    try:
+        keyring.set_password(CACHE_SERVICE, CACHE_ACCOUNT, key)
+    except keyring.errors.KeyringError:
+        pass  # cache is best-effort; worst case is dialogs again next run
+
+
+def fresh_key() -> str:
     with open(CONFIG_PATH) as f:
-        return json.load(f)["key"]
+        cfg = json.load(f)
+    if "key" in cfg:
+        return cfg["key"]
+    if "encryptedKey" in cfg and sys.platform == "darwin":
+        return decrypt_key_macos(cfg["encryptedKey"])
+    sys.exit(
+        "signal-transcript: no usable DB key in config.json "
+        f"(found {sorted(cfg.keys())}); only plaintext 'key' or macOS 'encryptedKey' are supported"
+    )
+
+
+def decrypt_key_macos(encrypted_hex: str) -> str:
+    """Decrypt config.json's encryptedKey via the macOS Keychain.
+
+    Electron safeStorage on macOS is Chromium os_crypt: the Keychain item
+    'Signal Safe Storage' holds a password, stretched with PBKDF2-SHA1
+    (salt 'saltysalt', 1003 rounds) into an AES-128 key; encryptedKey is
+    hex('v10' || AES-128-CBC(ciphertext, IV=16 spaces)) of the hex DB key.
+    """
+    blob = bytes.fromhex(encrypted_hex)
+    if not blob.startswith(b"v10"):
+        sys.exit(f"signal-transcript: unsupported encryptedKey version {blob[:3]!r} (expected v10)")
+    try:
+        secret = keyring.get_password("Signal Safe Storage", "Signal Key")
+    except keyring.errors.KeyringError as e:
+        sys.exit(f"signal-transcript: macOS Keychain refused access: {e}")
+    if not secret:
+        sys.exit(
+            "signal-transcript: could not read 'Signal Safe Storage' from the macOS Keychain. "
+            "If a permission dialog appeared, allow it and re-run."
+        )
+    password = secret.encode()
+    aes_key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1003, dklen=16)
+    dec = Cipher(algorithms.AES(aes_key), modes.CBC(b" " * 16)).decryptor()
+    padded = dec.update(blob[3:]) + dec.finalize()
+    pad = padded[-1]
+    if not 1 <= pad <= 16 or padded[-pad:] != bytes([pad]) * pad:
+        sys.exit("signal-transcript: encryptedKey decryption produced bad padding — wrong Keychain password?")
+    key = padded[:-pad].decode("ascii", errors="replace")
+    if not re.fullmatch(r"[0-9a-f]{64}", key):
+        sys.exit("signal-transcript: decrypted key is not a 64-char hex string — Signal key format changed?")
+    return key
 
 
 def copy_db(tmpdir: str) -> str:
@@ -86,10 +164,33 @@ def copy_db(tmpdir: str) -> str:
     return os.path.join(tmpdir, "db.sqlite")
 
 
+# Wrong/stale key surfaces as DatabaseError ("file is not a database") on the
+# first real query, from either exception hierarchy.
+DB_KEY_ERRORS = (sqlite3.DatabaseError, sqlcipher3.DatabaseError)
+
+
 def open_db(path: str, key: str):
+    """Open the DB copy with `key`; returns None if the key is rejected."""
     db = sqlcipher3.connect(path)
     c = db.cursor()
     c.execute(f'PRAGMA key = "x\'{key}\'"')
+    try:
+        c.execute("SELECT count(*) FROM sqlite_master")
+    except DB_KEY_ERRORS:
+        db.close()
+        return None
+    return db
+
+
+def connect_db(dbpath: str):
+    key = cached_key()
+    if key is not None and (db := open_db(dbpath, key)) is not None:
+        return db
+    key = fresh_key()
+    db = open_db(dbpath, key)
+    if db is None:
+        sys.exit("signal-transcript: DB key rejected — Signal may have re-keyed its database.")
+    store_cached_key(key)
     return db
 
 
@@ -481,11 +582,10 @@ def main():
     if not args.list and not args.query:
         ap.error("query is required unless --list is given")
 
-    key = load_key()
     tmpdir = tempfile.mkdtemp(prefix="signal-transcript-")
     try:
         dbpath = copy_db(tmpdir)
-        db = open_db(dbpath, key)
+        db = connect_db(dbpath)
 
         if args.list:
             cmd_list(db)
