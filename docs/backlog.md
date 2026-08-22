@@ -1,7 +1,7 @@
 # signal-transcript — backlog
 
-Ideas not yet built. The tool itself is `.local/bin/signal-transcript`; the Claude-facing
-usage contract is `.claude/skills/signal-transcript/SKILL.md`.
+Ideas not yet built. The tool is `signal-transcript`; the Claude-facing usage contract is
+`skills/signal-transcript/SKILL.md`.
 
 ## Delayed-send timestamp annotation
 
@@ -57,3 +57,44 @@ This belongs in the watcher loop, not in the tool: `--after` already returns the
 the rendered line names the speaker, so the policy is ~12 lines of shell and stays tunable
 per conversation. A `--follow` mode with a fixed debounce baked in would be strictly worse.
 Revisit only if one set of numbers turns out to fit every conversation.
+
+## Test suite
+
+There is none, and schema drift is the tool's main failure mode — it reads an undocumented
+SQLCipher schema belonging to an app that auto-updates.
+
+Signal's DB has 57 tables; the tool touches 5 (`messages`, `conversations`, `reactions`,
+`message_attachments`, `callsHistory`), whose combined DDL is ~7.8 KB and contains no data.
+So the fixture is a generated SQLCipher database built from that schema and populated with
+fabricated messages — publishable, runnable in CI, and a real test of the contract.
+
+Worth covering:
+
+- **Schema contract** — every column the tool selects exists and holds the type it assumes.
+- **Cursor invariants** — `received_at` is non-null and non-decreasing in insert order; a
+  chain of `--after` pulls over a fixture is contiguous, with no gaps and no repeats.
+- **Ordering** — a message whose `sent_at` precedes its predecessor's still renders in
+  arrival order, and a `--since` window admits it when only `received_at_ms` is in range.
+- **Attachment crypto** — round-trip a synthesized `v2` blob: encrypt a known payload under
+  a fabricated `localKey`, then assert the decrypt, the HMAC rejection on a flipped bit, and
+  the plaintext-hash mismatch path.
+- **Key extraction** — the Linux plaintext path, and the macOS `os_crypt` unwrap against a
+  fabricated Keychain secret.
+
+No test may touch a real Signal database. A separate opt-in check can verify the local
+install still matches, asserting shapes only and never message content.
+
+## --doctor
+
+Preflight and drift check, as a flag on the tool rather than an install script: the script
+already knows how to locate the Signal directory per platform, extract the key two different
+ways, and probe the schema, and a shell installer would reimplement all of it and drift.
+
+Should report: `uv` present; Signal Desktop installed and its directory found; the DB key
+extractable (naming which path, and warning about the macOS double dialog); the DB readable;
+`~/.local/bin` on `PATH`; every table and column the tool selects present.
+
+The useful part is version drift. `PRAGMA user_version` is Signal's migration counter — 1760
+as of 2026-08-21. Recording the highest tested value lets `--doctor` say "Signal has migrated
+to 1784; tested through 1760" *before* a query fails mid-transcript, which is the failure
+anyone running an old copy of this script will hit first.
