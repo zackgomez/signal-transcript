@@ -12,6 +12,9 @@ Run `signal-transcript --help` for full usage — it is the authoritative refere
 Rules for Claude:
 
 - Primary invocation: `signal-transcript "Aaron" --since 10m`. Output is markdown on stdout — read it directly; only use `--out FILE` for unusually large pulls.
+- **Following a live conversation**: every run ends with a `_cursor: N_` line. Seed with one windowed pull for context (`--since 30m`), then poll with `signal-transcript "Aaron" --after N`, taking the new cursor from each result. `--after` returns only what arrived since, so nothing you have already read is re-emitted; when nothing is new it costs a single line. Never re-poll with `--since` — that re-renders the whole window into context every time.
+- `--after` replaces the window and cannot be combined with `--since` or `--last`. If a tail pull reports it capped at `--max`, pull again with the returned cursor — the batch resumes exactly where it stopped rather than skipping ahead.
+- Reactions and edits do not tail. They do not advance a message's position in the stream, so `--after` will never surface them; re-pull the window if a reaction matters.
 - Scope discipline: this reads Zack's private messages. Always scope to the named person and the smallest sensible time window (`--since`, `--last N`). Never dump the whole archive, and don't pull unrelated conversations out of curiosity.
 - To read attachment contents (sent files, pasted images), add `--attachments DIR` pointed at the session scratchpad — it decrypts each in-scope attachment to DIR and the transcript line gains the saved path, which you can then Read directly (text and images both). A `(extract failed: …)` annotation means that one attachment couldn't be recovered — usually not yet downloaded by Signal Desktop.
 - Ambiguous name match exits 2 and lists candidates on stderr — pick from those or ask Zack, don't retry with a guessed name.

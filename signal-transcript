@@ -7,6 +7,10 @@
 signal-transcript — extract scoped, well-formatted transcripts from Signal Desktop's
 local (SQLCipher-encrypted) message database, for pasting/reading by Claude.
 
+Every run ends with a `cursor:` line — the highest received_at it covered. Passing that
+back as --after returns only what has arrived since, which is how a conversation is
+followed live without re-emitting messages the reader already has.
+
 Never touches the live DB: copies db.sqlite(+wal/shm) into a tempdir, opens the copy,
 and always cleans up. Read-only against Signal's data by construction; the only
 writes are transcript output (--out) and decrypted attachment copies (--attachments DIR).
@@ -270,6 +274,16 @@ def fetch_messages_rows(c, sql: str, params) -> list[dict]:
         return [dict(zip(col_names, r)) for r in rows]
     except DB_OPERATIONAL_ERRORS:
         die_schema_changed("messages")
+
+
+def cursor_of(msg_rows: list[dict]) -> int | None:
+    """Highest received_at among the fetched rows, or None if there were none.
+
+    Taken over fetched rather than rendered rows so that a batch of nothing but noise
+    events still advances the cursor — otherwise a --after tail would re-fetch and
+    re-discard them on every pull and never move forward.
+    """
+    return max((r["received_at"] for r in msg_rows), default=None)
 
 
 def sent_at_range(msg_rows: list[dict]) -> tuple[datetime | None, datetime | None]:
@@ -583,6 +597,10 @@ def main():
     ap.add_argument("query", nargs="?", help="contact/group name substring (case-insensitive)")
     ap.add_argument("--since", help="duration (10m/2h/3d/1w) or date (YYYY-MM-DD[ HH:MM]); default 1h")
     ap.add_argument("--last", type=int, help="most recent N messages instead of a time window")
+    ap.add_argument("--after", type=int, metavar="CURSOR",
+                    help="only messages newer than CURSOR, as printed in a previous run's "
+                         "trailing 'cursor:' line; for tailing a live conversation without "
+                         "re-emitting what you already read")
     ap.add_argument("--list", action="store_true", help="list conversations and exit")
     ap.add_argument("--max", type=int, default=500, help="cap on rendered messages (default 500)")
     ap.add_argument("--out", help="write output to FILE instead of stdout")
@@ -594,6 +612,8 @@ def main():
 
     if not args.list and not args.query:
         ap.error("query is required unless --list is given")
+    if args.after is not None and (args.since or args.last):
+        ap.error("--after replaces the window; it cannot be combined with --since or --last")
 
     tmpdir = tempfile.mkdtemp(prefix="signal-transcript-")
     try:
@@ -620,7 +640,23 @@ def main():
         )
 
         truncated = False
-        if args.last:
+        tail_mode = args.after is not None
+        if tail_mode:
+            msg_rows = fetch_messages_rows(
+                c,
+                f"SELECT {cols} FROM messages WHERE conversationId=? AND received_at > ? "
+                f"ORDER BY received_at ASC, sent_at ASC",
+                (conv["id"], args.after),
+            )
+            if len(msg_rows) > args.max:
+                # Keep the OLDEST here, unlike the windowed modes: the returned cursor then
+                # lands mid-stream and the next pull resumes exactly where this one stopped,
+                # so an over-long backlog is paced rather than skipped.
+                truncated = True
+                msg_rows = msg_rows[:args.max]
+            window_label = "new"
+            start_dt, end_dt = sent_at_range(msg_rows)
+        elif args.last:
             msg_rows = fetch_messages_rows(
                 c,
                 f"SELECT {cols} FROM messages WHERE conversationId=? "
@@ -668,6 +704,30 @@ def main():
         lines = render_messages(db, conv, msg_rows, conv_by_id, conv_by_serviceid, is_group,
                                 args.verbose, attachments_dir)
 
+        # An empty pull must still hand back the caller's place in the stream, and a first
+        # pull that found nothing should park at the present rather than at the beginning.
+        cursor = cursor_of(msg_rows)
+        if cursor is None:
+            cursor = args.after
+        if cursor is None:
+            try:
+                c.execute("SELECT max(received_at) FROM messages WHERE conversationId=?",
+                          (conv["id"],))
+                cursor = c.fetchone()[0]
+            except DB_OPERATIONAL_ERRORS:
+                die_schema_changed("messages")
+        cursor = cursor or 0
+
+        if tail_mode and not lines:
+            # The whole point of tailing: nothing new costs one line, not a header block.
+            output = f"_no new messages · cursor: {cursor}_\n"
+            if args.out:
+                with open(args.out, "w") as f:
+                    f.write(output)
+            else:
+                sys.stdout.write(output)
+            return
+
         name = conv_display_name(conv)
         out_lines = [f"# Signal — {name}"]
         count = len(msg_rows)
@@ -676,10 +736,14 @@ def main():
         else:
             meta = f"_{window_label} · 0 messages_"
         out_lines.append(meta)
-        if truncated:
+        if truncated and tail_mode:
+            out_lines.append(f"_(capped at {args.max} messages — more remain; pull again with the cursor below)_")
+        elif truncated:
             out_lines.append(f"_(truncated to the most recent {args.max} messages — older messages in this window were omitted)_")
         out_lines.append("")
         out_lines.extend(lines)
+        out_lines.append("")
+        out_lines.append(f"_cursor: {cursor}_")
 
         output = "\n".join(out_lines) + "\n"
         if args.out:
