@@ -178,7 +178,7 @@ def open_db(path: str, key: str):
     """Open the DB copy with `key`; returns None if the key is rejected."""
     db = sqlcipher3.connect(path)
     c = db.cursor()
-    c.execute(f'PRAGMA key = "x\'{key}\'"')
+    c.execute(f"PRAGMA key = \"x'{key}'\"")
     try:
         c.execute("SELECT count(*) FROM sqlite_master")
     except DB_KEY_ERRORS:
@@ -202,6 +202,7 @@ def connect_db(dbpath: str):
 # --------------------------------------------------------------------------
 # Time parsing / formatting
 # --------------------------------------------------------------------------
+
 
 def parse_since(s: str) -> datetime:
     s = s.strip()
@@ -240,6 +241,7 @@ def fmt_range_label(start_dt: datetime, end_dt: datetime) -> str:
 # Conversation resolution
 # --------------------------------------------------------------------------
 
+
 def conv_display_name(row: dict) -> str:
     return row.get("name") or row.get("profileFullName") or row.get("profileName") or row.get("e164") or "Unknown"
 
@@ -266,10 +268,7 @@ def own_name(db) -> str:
 def fetch_all_conversations(db) -> list[dict]:
     c = db.cursor()
     try:
-        c.execute(
-            "SELECT id, type, name, profileName, profileFullName, e164, serviceId, active_at "
-            "FROM conversations"
-        )
+        c.execute("SELECT id, type, name, profileName, profileFullName, e164, serviceId, active_at FROM conversations")
         cols = [d[0] for d in c.description]
         return [dict(zip(cols, row, strict=True)) for row in c.fetchall()]
     except DB_OPERATIONAL_ERRORS:
@@ -315,8 +314,10 @@ def sent_at_range(msg_rows: list[dict]) -> tuple[datetime | None, datetime | Non
     if not msg_rows:
         return None, None
     stamps = [r["sent_at"] for r in msg_rows]
-    return (datetime.fromtimestamp(min(stamps) / 1000).astimezone(),
-            datetime.fromtimestamp(max(stamps) / 1000).astimezone())
+    return (
+        datetime.fromtimestamp(min(stamps) / 1000).astimezone(),
+        datetime.fromtimestamp(max(stamps) / 1000).astimezone(),
+    )
 
 
 def fmt_active_at(ms) -> str:
@@ -404,6 +405,7 @@ def extract_attachment(att: dict, out_dir: str, when: datetime) -> str:
 # Message rendering
 # --------------------------------------------------------------------------
 
+
 def get_body(row_body, row_json: dict) -> str | None:
     if row_body:
         return row_body
@@ -438,9 +440,17 @@ def call_direction_label(call_row) -> str:
     return label
 
 
-def render_messages(db, conv: dict, msg_rows: list[dict], conv_by_id: dict, conv_by_serviceid: dict,
-                     is_group: bool, verbose: bool, attachments_dir: str | None = None,
-                     me: str | None = None) -> list[str]:
+def render_messages(
+    db,
+    conv: dict,
+    msg_rows: list[dict],
+    conv_by_id: dict,
+    conv_by_serviceid: dict,
+    is_group: bool,
+    verbose: bool,
+    attachments_dir: str | None = None,
+    me: str | None = None,
+) -> list[str]:
     c = db.cursor()
     me = me or own_name(db)
 
@@ -539,8 +549,12 @@ def render_messages(db, conv: dict, msg_rows: list[dict], conv_by_id: dict, conv
                     text += " (edited)"
                 body_lines_out.append(text)
 
-        if not body_lines_out and not reactions_by_msg.get(row["id"]) and not attachments_by_msg.get(row["id"]) \
-                and not data.get("quote"):
+        if (
+            not body_lines_out
+            and not reactions_by_msg.get(row["id"])
+            and not attachments_by_msg.get(row["id"])
+            and not data.get("quote")
+        ):
             # nothing renderable at all
             continue
 
@@ -582,6 +596,7 @@ def render_messages(db, conv: dict, msg_rows: list[dict], conv_by_id: dict, conv
 # Main
 # --------------------------------------------------------------------------
 
+
 def cmd_list(db):
     conversations = fetch_all_conversations(db)
     conversations.sort(key=lambda r: r.get("active_at") or 0, reverse=True)
@@ -598,16 +613,20 @@ def resolve_conversation(db, query: str):
     if len(matches) > 1:
         print(f"Multiple conversations match {query!r}:", file=sys.stderr)
         for row in matches:
-            print(f"  {conv_display_name(row):30} {row['type']:8} last active {fmt_active_at(row.get('active_at'))}",
-                  file=sys.stderr)
+            print(
+                f"  {conv_display_name(row):30} {row['type']:8} last active {fmt_active_at(row.get('active_at'))}",
+                file=sys.stderr,
+            )
         sys.exit(2)
     # no match
     print(f"No conversation matches {query!r}.", file=sys.stderr)
     conversations.sort(key=lambda r: r.get("active_at") or 0, reverse=True)
     print("Most recently active conversations:", file=sys.stderr)
     for row in conversations[:8]:
-        print(f"  {conv_display_name(row):30} {row['type']:8} last active {fmt_active_at(row.get('active_at'))}",
-              file=sys.stderr)
+        print(
+            f"  {conv_display_name(row):30} {row['type']:8} last active {fmt_active_at(row.get('active_at'))}",
+            file=sys.stderr,
+        )
     sys.exit(1)
 
 
@@ -619,18 +638,24 @@ def main():
     ap.add_argument("query", nargs="?", help="contact/group name substring (case-insensitive)")
     ap.add_argument("--since", help="duration (10m/2h/3d/1w) or date (YYYY-MM-DD[ HH:MM]); default 1h")
     ap.add_argument("--last", type=int, help="most recent N messages instead of a time window")
-    ap.add_argument("--after", type=int, metavar="CURSOR",
-                    help="only messages newer than CURSOR, as printed in a previous run's "
-                         "trailing 'cursor:' line; for tailing a live conversation without "
-                         "re-emitting what you already read")
+    ap.add_argument(
+        "--after",
+        type=int,
+        metavar="CURSOR",
+        help="only messages newer than CURSOR, as printed in a previous run's "
+        "trailing 'cursor:' line; for tailing a live conversation without "
+        "re-emitting what you already read",
+    )
     ap.add_argument("--list", action="store_true", help="list conversations and exit")
     ap.add_argument("--max", type=int, default=500, help="cap on rendered messages (default 500)")
     ap.add_argument("--out", help="write output to FILE instead of stdout")
-    ap.add_argument("--attachments", metavar="DIR",
-                    help="decrypt attachments of in-scope messages into DIR "
-                         "(created if needed); transcript lines gain the saved path")
-    ap.add_argument("--me", metavar="NAME",
-                    help="label for your own messages (default: this account's profile name)")
+    ap.add_argument(
+        "--attachments",
+        metavar="DIR",
+        help="decrypt attachments of in-scope messages into DIR "
+        "(created if needed); transcript lines gain the saved path",
+    )
+    ap.add_argument("--me", metavar="NAME", help="label for your own messages (default: this account's profile name)")
     ap.add_argument("--verbose", action="store_true", help="include noise event types")
     args = ap.parse_args()
 
@@ -658,10 +683,7 @@ def main():
         # leading sort key of its own conversation indexes — ordering by it reproduces
         # the order Signal Desktop itself renders. sent_at is the sender's clock and is
         # only used for display. received_at_ms is local arrival wall-clock.
-        cols = (
-            "id, json, body, type, sent_at, received_at, received_at_ms, "
-            "sourceServiceId, isViewOnce"
-        )
+        cols = "id, json, body, type, sent_at, received_at, received_at_ms, sourceServiceId, isViewOnce"
 
         truncated = False
         tail_mode = args.after is not None
@@ -677,22 +699,21 @@ def main():
                 # lands mid-stream and the next pull resumes exactly where this one stopped,
                 # so an over-long backlog is paced rather than skipped.
                 truncated = True
-                msg_rows = msg_rows[:args.max]
+                msg_rows = msg_rows[: args.max]
             window_label = "new"
             start_dt, end_dt = sent_at_range(msg_rows)
         elif args.last:
             msg_rows = fetch_messages_rows(
                 c,
-                f"SELECT {cols} FROM messages WHERE conversationId=? "
-                f"ORDER BY received_at DESC, sent_at DESC LIMIT ?",
+                f"SELECT {cols} FROM messages WHERE conversationId=? ORDER BY received_at DESC, sent_at DESC LIMIT ?",
                 (conv["id"], max(args.last, args.max)),
             )
             msg_rows.reverse()
             if len(msg_rows) > args.max:
                 truncated = True
-                msg_rows = msg_rows[-args.max:]
+                msg_rows = msg_rows[-args.max :]
             elif len(msg_rows) > args.last:
-                msg_rows = msg_rows[-args.last:]
+                msg_rows = msg_rows[-args.last :]
             window_label = f"last {args.last} messages"
             start_dt, end_dt = sent_at_range(msg_rows)
         else:
@@ -708,7 +729,7 @@ def main():
             )
             if len(msg_rows) > args.max:
                 truncated = True
-                msg_rows = msg_rows[-args.max:]
+                msg_rows = msg_rows[-args.max :]
             m = DURATION_RE.match(since_str.strip())
             if m:
                 n, unit = m.group(1), m.group(2).lower()
@@ -725,8 +746,9 @@ def main():
             attachments_dir = os.path.abspath(os.path.expanduser(args.attachments))
             os.makedirs(attachments_dir, exist_ok=True)
 
-        lines = render_messages(db, conv, msg_rows, conv_by_id, conv_by_serviceid, is_group,
-                                args.verbose, attachments_dir, args.me)
+        lines = render_messages(
+            db, conv, msg_rows, conv_by_id, conv_by_serviceid, is_group, args.verbose, attachments_dir, args.me
+        )
 
         # An empty pull must still hand back the caller's place in the stream, and a first
         # pull that found nothing should park at the present rather than at the beginning.
@@ -735,8 +757,7 @@ def main():
             cursor = args.after
         if cursor is None:
             try:
-                c.execute("SELECT max(received_at) FROM messages WHERE conversationId=?",
-                          (conv["id"],))
+                c.execute("SELECT max(received_at) FROM messages WHERE conversationId=?", (conv["id"],))
                 cursor = c.fetchone()[0]
             except DB_OPERATIONAL_ERRORS:
                 die_schema_changed("messages")
@@ -756,14 +777,18 @@ def main():
         out_lines = [f"# Signal — {name}"]
         count = len(msg_rows)
         if start_dt and end_dt:
-            meta = f"_{window_label} · {fmt_range_label(start_dt, end_dt)} · {count} message{'s' if count != 1 else ''}_"
+            meta = (
+                f"_{window_label} · {fmt_range_label(start_dt, end_dt)} · {count} message{'s' if count != 1 else ''}_"
+            )
         else:
             meta = f"_{window_label} · 0 messages_"
         out_lines.append(meta)
         if truncated and tail_mode:
             out_lines.append(f"_(capped at {args.max} messages — more remain; pull again with the cursor below)_")
         elif truncated:
-            out_lines.append(f"_(truncated to the most recent {args.max} messages — older messages in this window were omitted)_")
+            out_lines.append(
+                f"_(truncated to the most recent {args.max} messages — older messages in this window were omitted)_"
+            )
         out_lines.append("")
         out_lines.extend(lines)
         out_lines.append("")
