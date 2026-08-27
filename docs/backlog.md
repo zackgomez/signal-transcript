@@ -10,15 +10,15 @@ labelled with `sent_at` (the sender's clock). When a message was queued before d
 an outage, travel, a phone offline — its label reads earlier than the lines above it:
 
 ```
-**13:42 Aaron Sharpe:** I can certainly recruit more help tomorrow but we lose a day
-**13:12 Zack:**
+**13:42 Sam Okafor:** I can push the deadline a day if that helps
+**13:12 Dana Reyes:**
   [attachment: image/jpeg — signal-2026-08-02-131229.jpeg]
-**13:44 Zack:** It took you all week to make ur talk
+**13:44 Dana Reyes:** that works, sending the draft now
 ```
 
 The order is correct and matches Signal Desktop; only the label looks wrong. Proposal is to
-render delayed rows as `**13:12→13:43 Zack:**` when `received_at_ms - sent_at` exceeds ~60s,
-so the backwards jump explains itself instead of reading as corruption. Deferred — the
+render delayed rows as `**13:12→13:43 Dana Reyes:**` when `received_at_ms - sent_at` exceeds
+~60s, so the backwards jump explains itself instead of reading as corruption. Deferred — the
 annotation is display noise on every normal day, and delayed sends are rare.
 
 ## Reactions and edits do not tail
@@ -35,13 +35,13 @@ last rendered day.
 
 ## Wake policy for a following Claude
 
-Tailing with `--after` in a `Monitor` loop wakes the reader on every message, which for the
-Aaron thread is ~87 wakes/day against a median inter-message gap of 14s — the conversation
+Tailing with `--after` in a `Monitor` loop wakes the reader on every message, which for
+one active thread is ~87 wakes/day against a median inter-message gap of 14s — the conversation
 arrives in bursts, so nearly every wake carries one line.
 
 Batching on a quiet period, with a message cap and a max-wait so a fast back-and-forth
-cannot stall the batch, and triggering only on incoming (while still delivering Zack's own
-messages as context, since a reply is unreadable without the question):
+cannot stall the batch, and triggering only on incoming (while still delivering the user's
+own messages as context, since a reply is unreadable without the question):
 
 ```
 policy                                    /day  msgs/wake  med lat  p95 lat   worst
@@ -94,7 +94,7 @@ Should report: `uv` present; Signal Desktop installed and its directory found; t
 extractable (naming which path, and warning about the macOS double dialog); the DB readable;
 `~/.local/bin` on `PATH`; every table and column the tool selects present.
 
-The useful part is version drift. `PRAGMA user_version` is Signal's migration counter — 1760
-as of 2026-08-21. Recording the highest tested value lets `--doctor` say "Signal has migrated
-to 1784; tested through 1760" *before* a query fails mid-transcript, which is the failure
+The useful part is version drift. `PRAGMA user_version` is Signal's migration counter — 1770
+as of 2026-08-26. Recording the highest tested value lets `--doctor` say "Signal has migrated
+to 1784; tested through 1770" *before* a query fails mid-transcript, which is the failure
 anyone running an old copy of this script will hit first.

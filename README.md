@@ -8,13 +8,13 @@ grep your own messages, feed a thread to an LLM, or follow a live conversation w
 copy-pasting screenshots.
 
 ```
-$ signal-transcript "Aaron" --since 30m
-# Signal — Aaron Sharpe
-_last 30 minutes · 2026-08-21 22:11–22:15 EDT · 5 messages_
+$ signal-transcript "Sam" --since 30m
+# Signal — Sam Okafor
+_last 30 minutes · 2026-08-21 22:11–22:15 EDT · 3 messages_
 
-**22:11 Zack:** is that all you think needs to be changed?
-**22:13 Aaron Sharpe:** just send another rev but should begood
-**22:15 Aaron Sharpe:** lgtm
+**22:11 Dana Reyes:** does 3pm still work for you?
+**22:13 Sam Okafor:** yeah, and I'll bring the revised numbers
+**22:15 Dana Reyes:** perfect
 
 _cursor: 1772999891276_
 ```
@@ -31,13 +31,25 @@ signal-transcript --list
 
 macOS and Linux. `signal-transcript --help` is the authoritative usage reference.
 
+Your own messages are labelled with the Signal profile name on the account; `--me NAME`
+overrides that.
+
+## Claude Code
+
+`skills/signal-transcript/` is a skill:
+
+```sh
+mkdir -p ~/.claude/skills
+ln -s "$PWD/skills/signal-transcript" ~/.claude/skills/
+```
+
 ## Following a conversation
 
 Every run ends with a `cursor:` line — the highest arrival counter it covered. Pass it back
 as `--after` to get only what has landed since:
 
 ```sh
-$ signal-transcript "Aaron" --after 1772999891276
+$ signal-transcript "Sam" --after 1772999891276
 _no new messages · cursor: 1772999891276_
 ```
 
