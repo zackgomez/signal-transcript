@@ -243,6 +243,25 @@ def conv_display_name(row: dict) -> str:
     return row.get("name") or row.get("profileFullName") or row.get("profileName") or row.get("e164") or "Unknown"
 
 
+def own_name(db) -> str:
+    """Label for this account's own messages.
+
+    `items.uuid_id` is the account ACI with a device suffix (`<aci>.<device>`); the
+    conversation row carrying that serviceId is the account's own contact card.
+    """
+    c = db.cursor()
+    try:
+        row = c.execute("SELECT json FROM items WHERE id = 'uuid_id'").fetchone()
+        aci = json.loads(row[0])["value"].split(".")[0]
+        me = c.execute(
+            "SELECT profileFullName, profileName, e164 FROM conversations WHERE serviceId = ?",
+            (aci,),
+        ).fetchone()
+    except (*DB_OPERATIONAL_ERRORS, json.JSONDecodeError, KeyError, TypeError, IndexError):
+        return "Me"
+    return next((f for f in (me or ()) if f), "Me")
+
+
 def fetch_all_conversations(db) -> list[dict]:
     c = db.cursor()
     try:
@@ -419,8 +438,10 @@ def call_direction_label(call_row) -> str:
 
 
 def render_messages(db, conv: dict, msg_rows: list[dict], conv_by_id: dict, conv_by_serviceid: dict,
-                     is_group: bool, verbose: bool, attachments_dir: str | None = None) -> list[str]:
+                     is_group: bool, verbose: bool, attachments_dir: str | None = None,
+                     me: str | None = None) -> list[str]:
     c = db.cursor()
+    me = me or own_name(db)
 
     # Preload calls history for any call-history messages in view
     call_ids = [r["id"] for r in msg_rows if r["type"] == "call-history"]
@@ -490,7 +511,7 @@ def render_messages(db, conv: dict, msg_rows: list[dict], conv_by_id: dict, conv
 
         # sender
         if mtype == "outgoing":
-            sender = "Zack"
+            sender = me
         elif is_group:
             svc = row.get("sourceServiceId")
             sender = conv_by_serviceid.get(svc)
@@ -534,7 +555,7 @@ def render_messages(db, conv: dict, msg_rows: list[dict], conv_by_id: dict, conv
             if len(qtext) > 60:
                 qtext = qtext[:60] + "…"
             qauthor_svc = quote.get("authorAci")
-            qauthor = conv_by_serviceid.get(qauthor_svc, "Zack" if qauthor_svc is None else qauthor_svc[:8])
+            qauthor = conv_by_serviceid.get(qauthor_svc, me if qauthor_svc is None else qauthor_svc[:8])
             lines.append(f'  ↪ re: "{qtext}" ({qauthor})')
 
         for emoji, fromId in reactions_by_msg.get(row["id"], []):
@@ -607,6 +628,8 @@ def main():
     ap.add_argument("--attachments", metavar="DIR",
                     help="decrypt attachments of in-scope messages into DIR "
                          "(created if needed); transcript lines gain the saved path")
+    ap.add_argument("--me", metavar="NAME",
+                    help="label for your own messages (default: this account's profile name)")
     ap.add_argument("--verbose", action="store_true", help="include noise event types")
     args = ap.parse_args()
 
@@ -702,7 +725,7 @@ def main():
             os.makedirs(attachments_dir, exist_ok=True)
 
         lines = render_messages(db, conv, msg_rows, conv_by_id, conv_by_serviceid, is_group,
-                                args.verbose, attachments_dir)
+                                args.verbose, attachments_dir, args.me)
 
         # An empty pull must still hand back the caller's place in the stream, and a first
         # pull that found nothing should park at the present rather than at the beginning.
