@@ -1,0 +1,9 @@
+target-version = "py311"
+line-length = 120
+extend-include = ["signal-transcript"]
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
+# E501: the formatter owns line width.
+# RUF001: en dashes in rendered transcript ranges are deliberate.
+ignore = ["E501", "RUF001"]

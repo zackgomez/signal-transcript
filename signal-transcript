@@ -18,6 +18,7 @@ writes are transcript output (--out) and decrypted attachment copies (--attachme
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -25,12 +26,13 @@ import mimetypes
 import os
 import re
 import shutil
-import sqlcipher3
 import sqlite3
 import sys
 import tempfile
 from datetime import datetime, timedelta
+from typing import NoReturn
 
+import sqlcipher3
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 if sys.platform == "darwin":
@@ -61,7 +63,7 @@ def warn_schema_once(table: str, lost: str) -> None:
     print(f"warning: Signal schema changed — '{table}' unavailable, {lost} omitted", file=sys.stderr)
 
 
-def die_schema_changed(table: str) -> None:
+def die_schema_changed(table: str) -> NoReturn:
     sys.exit(
         f"signal-transcript: Signal schema changed — table '{table}' missing or unreadable. "
         "Signal Desktop may have updated."
@@ -108,10 +110,9 @@ def cached_key() -> str | None:
 def store_cached_key(key: str) -> None:
     if sys.platform != "darwin":
         return
-    try:
+    # Caching is best-effort; worst case is the dialogs again next run.
+    with contextlib.suppress(keyring.errors.KeyringError):
         keyring.set_password(CACHE_SERVICE, CACHE_ACCOUNT, key)
-    except keyring.errors.KeyringError:
-        pass  # cache is best-effort; worst case is dialogs again next run
 
 
 def fresh_key() -> str:
@@ -270,7 +271,7 @@ def fetch_all_conversations(db) -> list[dict]:
             "FROM conversations"
         )
         cols = [d[0] for d in c.description]
-        return [dict(zip(cols, row)) for row in c.fetchall()]
+        return [dict(zip(cols, row, strict=True)) for row in c.fetchall()]
     except DB_OPERATIONAL_ERRORS:
         die_schema_changed("conversations")
 
@@ -290,7 +291,7 @@ def fetch_messages_rows(c, sql: str, params) -> list[dict]:
         c.execute(sql, params)
         rows = c.fetchall()
         col_names = [d[0] for d in c.description]
-        return [dict(zip(col_names, r)) for r in rows]
+        return [dict(zip(col_names, r, strict=True)) for r in rows]
     except DB_OPERATIONAL_ERRORS:
         die_schema_changed("messages")
 
@@ -485,7 +486,7 @@ def render_messages(db, conv: dict, msg_rows: list[dict], conv_by_id: dict, conv
             )
             att_cols = [d[0] for d in c.description]
             for r in c.fetchall():
-                att = dict(zip(att_cols, r))
+                att = dict(zip(att_cols, r, strict=True))
                 attachments_by_msg.setdefault(att["messageId"], []).append(att)
         except DB_OPERATIONAL_ERRORS:
             warn_schema_once("message_attachments", "attachments")
@@ -708,8 +709,8 @@ def main():
             if len(msg_rows) > args.max:
                 truncated = True
                 msg_rows = msg_rows[-args.max:]
-            if DURATION_RE.match(since_str.strip()):
-                m = DURATION_RE.match(since_str.strip())
+            m = DURATION_RE.match(since_str.strip())
+            if m:
                 n, unit = m.group(1), m.group(2).lower()
                 unit_word = {"m": "minute", "h": "hour", "d": "day", "w": "week"}[unit]
                 if n != "1":
